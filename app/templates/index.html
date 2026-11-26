@@ -18,10 +18,11 @@
     <div class="top-actions">
       <label class="threshold-box">
         Fréchet 上限
-        <input id="threshold" type="range" min="40" max="600" step="10"
-               value="{{ default_threshold }}" />
+        <input id="threshold" type="range" min="{{ slider_min }}" max="{{ slider_max }}"
+               step="{{ slider_step }}" value="{{ default_threshold }}" />
         <span class="threshold-value"><b id="thresholdValue">{{ default_threshold }}</b> / {{ grid }}</span>
       </label>
+      <span id="sliderTrialText" class="threshold-probe" aria-live="polite"></span>
     </div>
   </header>
 
@@ -29,6 +30,38 @@
     <!-- ======================= Canvas card ======================= -->
     <section class="card canvas-card">
       <div class="char-picker" id="charPicker" aria-label="选择范字"></div>
+
+      <!-- Slider-stop trial readout: populated from the one prepared sweep,
+           so dragging the threshold issues no requests. -->
+      <div id="sliderTrial" class="trial-bar is-dormant" aria-live="polite"
+           data-state="dormant" data-threshold="{{ default_threshold }}"
+           data-feasible="" data-cost="">
+        <div class="trial-main">
+          <span class="trial-title">配笔上限 <b id="trialThreshold">{{ default_threshold }}</b> 档</span>
+          <span id="trialDormant" class="trial-line muted">首次点「求最优修订」或「填入示例笔迹」后，这里会备好滑块每一档的最少改笔数；拖动滑块即可预看，不发请求。</span>
+          <span id="trialLoading" class="trial-line" hidden>各档试算准备中…（每对笔画的 Fréchet 距离只算一次）</span>
+          <span id="trialError" class="trial-line trial-error" hidden>
+            试算准备失败，笔迹已保留。
+            <button id="btnTrialRetry" class="btn btn-mini" type="button">重试准备</button>
+          </span>
+          <span id="trialResult" class="trial-line" hidden>
+            这一档最少要改 <b id="trialCost">0</b> 步
+            <span class="trial-chips">
+              <i class="chip chip-move">移 <b id="trialMove">0</b></i>
+              <i class="chip chip-del">删 <b id="trialDel">0</b></i>
+              <i class="chip chip-add">补 <b id="trialAdd">0</b></i>
+            </span>
+          </span>
+          <span id="trialNoSolution" class="trial-line trial-nosol" hidden>
+            这一档<b>无解</b>
+            <span id="trialReason" class="trial-reason"></span>
+          </span>
+        </div>
+        <div class="trial-side">
+          <span id="trialDragHint" class="trial-hint" hidden>拖动预看中：播放 / 采纳已停用，松开滑块生成正式方案</span>
+          <span id="trialConsistency" class="trial-consistent" hidden>✓ 正式方案的动作数与可行性和试算一致</span>
+        </div>
+      </div>
 
       <div class="canvas-wrap">
         <canvas id="board" width="1000" height="1000"
@@ -62,10 +95,19 @@
         </div>
 
         <div id="staleNotice" class="notice notice-warn" hidden>
-          笔迹或保留项已改变，旧建议已失效，请重新求解。
+          笔迹或保留项已改变，旧试算与建议已撤下，正在为新稿重新准备…
         </div>
 
         <div id="noSolution" class="notice notice-error" hidden></div>
+
+        <div id="planError" class="notice notice-warn" hidden>
+          <span id="planErrorText">正式方案求解失败，笔迹已保留。</span>
+          <button id="btnPlanRetry" class="btn btn-mini" type="button">重试求解</button>
+        </div>
+
+        <div id="planLoading" class="notice notice-info" hidden>
+          正在为所选档位生成正式方案…
+        </div>
 
         <div id="planSummary" class="summary" hidden>
           <div class="cost-big">最少 <b id="costTotal">0</b> 个动作</div>

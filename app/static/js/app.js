@@ -21,9 +21,16 @@ const state = {
   threshold: 180,
   plan: null,
   planStale: false,
-  everPlanned: false,
-  busy: false,
+  live: false, // first solve happened; later edits auto-prepare the new draft
+  seq: 0, // draft generation token: responses of older drafts never render
+  prep: null, // {status:'loading'|'ready'|'error', levels:Map, solveCount}
+  prepReqId: 0,
+  planLoading: false,
+  planError: "",
+  planThreshold: null, // threshold the current/last formal plan was solved at
   planReqId: 0,
+  planAbort: null,
+  sliderActive: false, // between first slider input and commit (change)
   pb: 0,
   playing: false,
   lastTick: 0,
@@ -147,42 +154,188 @@ async function fetchJSON(url) {
   return res.json();
 }
 
-async function requestPlan() {
-  const reqId = ++state.planReqId;
-  state.busy = true;
+function payloadStrokes() {
+  return state.strokes.map((s) => ({
+    uid: s.uid, points: s.points, preserved: !!s.preserved,
+  }));
+}
+
+// All slider stops, read from the real <input> configuration so the prepared
+// levels can never drift from what the teacher can drag to.
+function sliderLevels() {
+  const el = $("threshold");
+  const min = Number(el.min), max = Number(el.max);
+  const step = Number(el.step) || 10;
+  const out = [];
+  for (let v = min; v <= max + 1e-9; v += step) {
+    out.push(Math.round(v * 100) / 100);
+  }
+  return out;
+}
+
+function cancelFormalPlan() {
+  // Supersede any in-flight formal solution; its response must not render.
+  state.planReqId += 1;
+  if (state.planAbort) {
+    try { state.planAbort.abort(); } catch (_) { /* noop */ }
+    state.planAbort = null;
+  }
+  state.planLoading = false;
+}
+
+function makeAbortController() {
+  try {
+    if (typeof AbortController !== "function") return null;
+    return new AbortController();
+  } catch (_) {
+    return null;
+  }
+}
+
+// Immediately take down trials + formal plan of the current draft and advance
+// the draft token so every older response is dropped on arrival.
+function discardResults() {
+  const hadResults = !!(state.plan || state.prep);
+  state.seq += 1;
+  state.prepReqId += 1;
+  cancelFormalPlan();
+  state.prep = null;
+  state.plan = null;
+  state.planError = "";
+  state.planThreshold = null;
+  state.pb = 0;
+  state.playing = false;
+  // Only show the "old suggestion withdrawn" notice when something was shown.
+  state.planStale = state.live && hadResults;
+}
+
+// Fetch the all-stops trial sweep once for the current draft.
+function requestPreview() {
+  const seq = state.seq;
+  const prepReqId = ++state.prepReqId;
+  state.prep = { status: "loading", levels: new Map(), solveCount: 0 };
+  renderTrialProbe();
   updatePlanButtons();
+
+  return (async () => {
+    let data;
+    try {
+      const res = await fetch("/api/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          character_id: state.charId,
+          thresholds: sliderLevels(),
+          strokes: payloadStrokes(),
+        }),
+      });
+      data = await res.json();
+    } catch (e) {
+      // A newer draft / reset superseded this preparation: stay silent.
+      if (prepReqId !== state.prepReqId || seq !== state.seq) return false;
+      state.prep = { status: "error", levels: new Map(), error: e.message };
+      renderTrialProbe();
+      updatePlanButtons();
+      toast("试算准备失败：" + e.message + "（笔迹已保留，可点“重试准备”）");
+      return false;
+    }
+    // Old draft's response never reaches the screen.
+    if (prepReqId !== state.prepReqId || seq !== state.seq) return false;
+    if (!data || data.feasible === false || !Array.isArray(data.levels)) {
+      state.prep = {
+        status: "error",
+        levels: new Map(),
+        error: (data && data.reason) || "试算响应格式不正确",
+      };
+      renderTrialProbe();
+      updatePlanButtons();
+      toast("试算准备失败：" + state.prep.error + "（笔迹已保留，可重试）");
+      return false;
+    }
+    const levels = new Map();
+    for (const lv of data.levels) levels.set(Number(lv.threshold), lv);
+    state.prep = {
+      status: "ready",
+      levels,
+      solveCount: data.solve_count,
+      pairCount: data.pair_count,
+    };
+    renderTrialProbe();
+    return true;
+  })();
+}
+
+// Prepare every slider stop and, unless ``plan === false``, generate the
+// formal plan for the currently selected threshold in parallel.
+function prepareDraft({ plan = true } = {}) {
+  const prepPromise = requestPreview();
+  const planPromise = plan ? requestPlan() : Promise.resolve(false);
+  return { prepPromise, planPromise };
+}
+
+async function requestPlan() {
+  const seq = state.seq;
+  const reqId = ++state.planReqId;
+  if (state.planAbort) {
+    try { state.planAbort.abort(); } catch (_) { /* noop */ }
+  }
+  const ac = makeAbortController();
+  state.planAbort = ac;
+  state.planLoading = true;
+  state.planError = "";
+  renderPlanPanel();
+  updatePlanButtons();
+
   let data;
   try {
     const res = await fetch("/api/plan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: ac ? ac.signal : undefined,
       body: JSON.stringify({
         character_id: state.charId,
         threshold: Number(state.threshold),
-        strokes: state.strokes.map((s) => ({
-          uid: s.uid, points: s.points, preserved: !!s.preserved,
-        })),
+        strokes: payloadStrokes(),
       }),
     });
     data = await res.json();
   } catch (e) {
-    if (reqId !== state.planReqId) return;
-    toast("求解请求失败：" + e.message);
-    state.busy = false;
+    // Superseded by a newer request / slider re-drag / draft edit: drop silently.
+    if (e && e.name === "AbortError") return false;
+    if (reqId !== state.planReqId || seq !== state.seq) return false;
+    state.planLoading = false;
+    state.planError = "求解请求失败：" + e.message;
+    renderPlanPanel();
     updatePlanButtons();
-    return;
+    toast("求解失败：" + e.message + "（笔迹已保留，可点重试）");
+    return false;
   }
-  // A newer request superseded this one (rapid edits / toggles).
-  if (reqId !== state.planReqId) return;
-  state.busy = false;
-  state.everPlanned = true;
+  if (reqId !== state.planReqId || seq !== state.seq) return false;
+
+  state.planLoading = false;
+  state.live = true;
   state.plan = data;
   state.planStale = false;
+  state.planThreshold = Number(state.threshold);
   state.pb = 0;
   state.playing = false;
   renderPlanPanel();
   renderStepList();
   updatePlanButtons();
+  renderTrialProbe();
+  return true;
+}
+
+// Explicit first solve (button).  Arms live mode and prepares all stops plus
+// the formal plan for the current stop.
+function startSolving() {
+  if (!state.model.length) return;
+  state.live = true;
+  discardResults();
+  renderStrokeList();
+  renderPlanPanel();
+  renderStepList();
+  prepareDraft();
 }
 
 /* ------------------------- character picker ------------------------- */
@@ -210,22 +363,35 @@ async function selectCharacter(id, confirmChange) {
       !window.confirm("切换范字会清空当前笔迹与建议，确定吗？")) {
     return;
   }
-  const data = await fetchJSON(`/api/characters/${id}`);
+  // Tear down the old draft immediately (old responses are token-dropped).
+  const wasLive = state.live;
   state.charId = id;
-  state.model = data.strokes;
+  state.model = [];
   state.strokes = [];
-  state.plan = null;
-  state.planStale = false;
-  state.everPlanned = false;
-  state.pb = 0;
-  state.playing = false;
   $("adoptLog").innerHTML = "";
+  discardResults();
   document.querySelectorAll(".char-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.id === id));
   renderStrokeList();
+  renderTrialProbe();
   renderPlanPanel();
   renderStepList();
   updatePlanButtons();
+
+  let data;
+  try {
+    data = await fetchJSON(`/api/characters/${id}`);
+  } catch (e) {
+    toast("范字加载失败：" + e.message);
+    return;
+  }
+  // A newer character selection superseded this response.
+  if (state.charId !== id) return;
+  state.model = data.strokes;
+  updatePlanButtons();
+  // The spec lists switching model characters among the edits that immediately
+  // re-prepare once the workbench is live.
+  if (wasLive) prepareDraft();
 }
 
 /* --------------------------- canvas sizing --------------------------- */
@@ -557,19 +723,32 @@ canvas.addEventListener("pointercancel", endStroke);
 /* ------------------------- stroke list UI ------------------------- */
 
 function afterStrokesChanged() {
-  // Once the teacher has asked for a revision, keep the suggestion live:
-  // synchronously invalidate the old one, then recompute from actual order.
-  const shouldReplan = state.everPlanned;
-  invalidatePlan();
+  // Any handwriting / order / preserve edit is a new draft: synchronously
+  // drop old trials and plans, then prepare the new draft when live.
+  const shouldPrepare = state.live;
+  discardResults();
   renderStrokeList();
-  if (shouldReplan) requestPlan();
+  renderTrialProbe();
+  renderPlanPanel();
+  renderStepList();
+  updatePlanButtons();
+  if (shouldPrepare) return prepareDraft();
+  return null;
+}
+
+// Teacher manually changes the actual stroke order (the "改笔序" trigger).
+function moveStrokeOrder(index, delta) {
+  const j = index + delta;
+  if (j < 0 || j >= state.strokes.length) return;
+  const [item] = state.strokes.splice(index, 1);
+  state.strokes.splice(j, 0, item);
+  afterStrokesChanged();
 }
 
 function invalidatePlan() {
-  state.plan = null;
-  state.pb = 0;
-  state.playing = false;
-  state.planStale = state.everPlanned;
+  // Kept for older call sites: full teardown of results for this draft.
+  discardResults();
+  renderTrialProbe();
   renderPlanPanel();
   renderStepList();
   updatePlanButtons();
@@ -608,6 +787,27 @@ function renderStrokeList() {
     label.appendChild(cb);
     label.appendChild(document.createTextNode("保留"));
 
+    const orderBox = document.createElement("span");
+    orderBox.className = "order-actions";
+    const up = document.createElement("button");
+    up.type = "button";
+    up.className = "link-order";
+    up.textContent = "↑";
+    up.title = "上移笔序";
+    up.setAttribute("aria-label", `把第 ${i + 1} 笔上移一位`);
+    up.disabled = i === 0;
+    up.addEventListener("click", () => moveStrokeOrder(i, -1));
+    const down = document.createElement("button");
+    down.type = "button";
+    down.className = "link-order";
+    down.textContent = "↓";
+    down.title = "下移笔序";
+    down.setAttribute("aria-label", `把第 ${i + 1} 笔下移一位`);
+    down.disabled = i === state.strokes.length - 1;
+    down.addEventListener("click", () => moveStrokeOrder(i, 1));
+    orderBox.appendChild(up);
+    orderBox.appendChild(down);
+
     const del = document.createElement("button");
     del.type = "button";
     del.className = "link-del";
@@ -624,6 +824,7 @@ function renderStrokeList() {
 
     li.appendChild(badge);
     li.appendChild(meta);
+    li.appendChild(orderBox);
     li.appendChild(label);
     li.appendChild(del);
 
@@ -635,11 +836,138 @@ function renderStrokeList() {
 
 /* --------------------------- plan panel --------------------------- */
 
+function currentTrial() {
+  if (!state.prep || state.prep.status !== "ready") return null;
+  return state.prep.levels.get(Number(state.threshold)) || null;
+}
+
+function renderTrialProbe() {
+  const bar = $("sliderTrial");
+  const inline = $("sliderTrialText");
+  if (!bar || !inline) return;
+  const t = Number(state.threshold);
+  $("trialThreshold").textContent = String(t);
+  bar.dataset.threshold = String(t);
+
+  const dormant = $("trialDormant");
+  const loading = $("trialLoading");
+  const errBox = $("trialError");
+  const result = $("trialResult");
+  const noSol = $("trialNoSolution");
+  const dragHint = $("trialDragHint");
+  const consist = $("trialConsistency");
+  [dormant, loading, errBox, result, noSol].forEach((el) => { el.hidden = true; });
+  dragHint.hidden = !state.sliderActive;
+  consist.hidden = true;
+  consist.classList.remove("is-mismatch");
+  consist.textContent = "✓ 正式方案的动作数与可行性和试算一致";
+
+  bar.classList.remove("is-dormant", "is-loading", "is-error",
+                       "is-feasible", "is-infeasible", "is-dragging");
+  if (state.sliderActive) bar.classList.add("is-dragging");
+  inline.className = "threshold-probe";
+  inline.textContent = "";
+  inline.title = "";
+
+  if (!state.live || !state.prep) {
+    bar.classList.add("is-dormant");
+    bar.dataset.state = "dormant";
+    bar.dataset.feasible = "";
+    bar.dataset.cost = "";
+    dormant.hidden = false;
+    return;
+  }
+
+  if (state.prep.status === "loading") {
+    bar.classList.add("is-loading");
+    bar.dataset.state = "loading";
+    bar.dataset.feasible = "";
+    bar.dataset.cost = "";
+    loading.hidden = false;
+    inline.classList.add("is-busy");
+    inline.textContent = `上限 ${t}：各档试算准备中…`;
+    return;
+  }
+
+  if (state.prep.status === "error") {
+    bar.classList.add("is-error");
+    bar.dataset.state = "error";
+    bar.dataset.feasible = "";
+    bar.dataset.cost = "";
+    errBox.hidden = false;
+    inline.classList.add("is-busy");
+    inline.textContent = `上限 ${t}：试算准备失败，可重试`;
+    return;
+  }
+
+  const lv = state.prep.levels.get(t);
+  if (!lv) {
+    bar.dataset.state = "missing";
+    return;
+  }
+
+  // Preparation is ready; feasibility lives in data-feasible.
+  bar.dataset.state = "ready";
+  bar.dataset.feasible = String(!!lv.feasible);
+  if (lv.feasible) {
+    bar.classList.add("is-feasible");
+    bar.dataset.cost = String(lv.cost);
+    result.hidden = false;
+    $("trialCost").textContent = String(lv.cost);
+    $("trialMove").textContent = String(lv.counts.move);
+    $("trialDel").textContent = String(lv.counts.delete);
+    $("trialAdd").textContent = String(lv.counts.add);
+    inline.classList.add("is-feasible");
+    inline.textContent =
+      `上限 ${t}：最少 ${lv.cost} 步（移 ${lv.counts.move} · 删 ${lv.counts.delete} · 补 ${lv.counts.add}）`;
+  } else {
+    bar.classList.add("is-infeasible");
+    bar.dataset.cost = "";
+    noSol.hidden = false;
+    $("trialReason").textContent = lv.reason ? `—— ${lv.reason}` : "";
+    inline.classList.add("is-infeasible");
+    inline.textContent = `上限 ${t}：无解`;
+    inline.title = lv.reason || "";
+  }
+
+  // Cross-check the released formal plan against this stop's trial.
+  const p = state.plan;
+  if (!state.sliderActive && !state.planLoading && p &&
+      state.planThreshold === t) {
+    let ok = p.feasible === !!lv.feasible;
+    if (ok && p.feasible && lv.feasible && p.counts && lv.counts) {
+      ok = p.cost === lv.cost &&
+        p.counts.move === lv.counts.move &&
+        p.counts.delete === lv.counts.delete &&
+        p.counts.add === lv.counts.add;
+    }
+    bar.dataset.consistent = ok ? "true" : "false";
+    if (ok) {
+      consist.hidden = false;
+    } else {
+      consist.hidden = false;
+      consist.classList.add("is-mismatch");
+      consist.textContent = "⚠ 正式方案与试算不一致，请点“求最优修订”重试";
+      // Should be unreachable: same core solver and same inputs.
+      console.error("plan/trial mismatch", { threshold: t, plan: p, trial: lv });
+    }
+  } else {
+    bar.dataset.consistent = "";
+  }
+}
+
 function renderPlanPanel() {
   const stale = $("staleNotice");
   const noSol = $("noSolution");
   const summary = $("planSummary");
-  stale.hidden = !(state.planStale && state.everPlanned && !state.plan);
+  const errBox = $("planError");
+  const loadingBox = $("planLoading");
+
+  stale.hidden = !(state.planStale && state.live && !state.plan);
+  errBox.hidden = !state.planError;
+  $("planErrorText").textContent =
+    state.planError || "正式方案求解失败，笔迹已保留。";
+  loadingBox.hidden = !state.planLoading;
 
   if (state.plan && state.plan.feasible) {
     noSol.hidden = true;
@@ -660,34 +988,44 @@ function renderPlanPanel() {
 }
 
 function updatePlanButtons() {
-  const hasFeasible = !!(state.plan && state.plan.feasible && !state.planStale);
-  const steps = hasFeasible ? state.plan.steps : [];
-  const realNext = hasFeasible ? state.plan.next_action : null;
+  const thresholdNow = Number(state.threshold);
+  const planCurrent = !!(state.plan && state.plan.feasible && !state.planStale &&
+    !state.planLoading && state.planThreshold === thresholdNow);
+  // While dragging the slider, playback and adoption are explicitly suspended.
+  const canUsePlan = planCurrent && !state.sliderActive;
+  const steps = canUsePlan ? state.plan.steps : [];
+  const realNext = canUsePlan ? state.plan.next_action : null;
 
-  $("btnPlan").disabled = state.busy || !state.model.length;
-  $("btnPlan").textContent = state.busy ? "求解中…" : "求最优修订";
+  $("btnPlan").disabled = state.planLoading || !state.model.length;
+  $("btnPlan").textContent = state.planLoading ? "求解中…" : "求最优修订";
 
-  $("btnAdopt").disabled = !realNext || state.busy;
-  if (realNext) {
+  $("btnAdopt").disabled = !realNext || state.planLoading || state.sliderActive;
+  if (state.sliderActive) {
+    $("btnAdopt").textContent = "松开滑块后生成正式方案";
+    $("adoptHint").textContent = "拖动中已停用采纳";
+  } else if (realNext) {
     const verb = realNext.kind === "delete" ? "删除" : "移动";
     const where = realNext.kind === "delete"
       ? `第 ${realNext.index + 1} 笔`
       : `第 ${realNext.from + 1} 笔 → 第 ${realNext.to + 1} 位`;
     $("btnAdopt").textContent = `采纳下一步：${verb}${where}`;
-    $("adoptHint").textContent = "采纳后按当前实际笔序重新求解";
+    $("adoptHint").textContent = "采纳后按当前实际笔序重新准备 / 求解";
   } else {
     $("btnAdopt").textContent = "采纳下一步移笔 / 删笔";
-    $("adoptHint").textContent = hasFeasible
+    $("adoptHint").textContent = planCurrent
       ? (state.plan.counts.add ? "已无需移 / 删，请播放查看虚线补笔" : "已经符合范字笔序")
-      : "";
+      : (state.planLoading ? "正式方案生成中…" : "");
   }
 
   const hasSteps = steps.length > 0;
-  $("btnPlay").disabled = !hasSteps;
-  $("btnNext").disabled = !hasSteps || state.pb >= steps.length;
-  $("btnPrev").disabled = !hasSteps || state.pb <= 0;
-  $("btnResetPb").disabled = !hasSteps || state.pb === 0;
+  $("btnPlay").disabled = !hasSteps || state.sliderActive;
+  $("btnNext").disabled = !hasSteps || state.pb >= steps.length || state.sliderActive;
+  $("btnPrev").disabled = !hasSteps || state.pb <= 0 || state.sliderActive;
+  $("btnResetPb").disabled = !hasSteps || state.pb === 0 || state.sliderActive;
   $("btnPlay").textContent = state.playing ? "暂停" : (state.pb >= steps.length ? "重播" : "播放");
+
+  const playback = document.querySelector(".playback");
+  if (playback) playback.classList.toggle("is-locked", !!state.sliderActive);
 }
 
 function stepTag(kind) {
@@ -710,6 +1048,7 @@ function renderStepList() {
       (i === state.pb - 1 ? " current" : "");
     li.innerHTML = `<span class="n">${i + 1}</span><span>${stepTag(s.kind)}${s.label}</span>`;
     li.addEventListener("click", () => {
+      if (state.sliderActive || state.planLoading) return;
       state.playing = false;
       state.pb = i + 1;
       state.lastTick = 0;
@@ -724,8 +1063,9 @@ function renderStepList() {
 /* --------------------------- adopt action --------------------------- */
 
 async function adoptNext() {
+  if (state.sliderActive || state.planLoading) return;
   const na = state.plan && state.plan.next_action;
-  if (!na || state.planStale) return;
+  if (!na || state.planStale || state.planThreshold !== Number(state.threshold)) return;
 
   // Guard against any index/uid mismatch.
   if (na.uid != null && state.strokes[na.index] &&
@@ -743,11 +1083,11 @@ async function adoptNext() {
   } else {
     applyMove(state.strokes, na.from, na.to);
   }
-  renderStrokeList();
-  // Drop the old suggestion, then recompute from the actual new stroke order.
-  invalidatePlan();
-  await requestPlan();
-  toast("已采纳，并按实际笔序重新计算");
+  // Content / actual stroke order changed: old trials and plan come down
+  // immediately and preparation for the new draft starts at once.
+  const prep = afterStrokesChanged();
+  const ok = prep ? await prep.planPromise : false;
+  if (ok) toast("已采纳，并按实际笔序重新计算");
 }
 
 function addAdoptLog(label) {
@@ -765,8 +1105,11 @@ function addAdoptLog(label) {
 
 async function loadSample() {
   if (!state.charId) return;
+  const charId = state.charId;
   try {
-    const data = await fetchJSON(`/api/sample/${state.charId}`);
+    const data = await fetchJSON(`/api/sample/${charId}`);
+    // Character switched while the sample was loading: drop stale response.
+    if (state.charId !== charId) return;
     state.colorCursor = 0;
     state.uidCursor = 1;
     state.strokes = data.strokes.map((s) => ({
@@ -775,12 +1118,12 @@ async function loadSample() {
       preserved: false,
       color: PALETTE[state.colorCursor++ % PALETTE.length],
     }));
-    state.everPlanned = false;
-    state.planStale = false;
+    state.live = true;
+    discardResults();
     renderStrokeList();
     $("canvasHint").style.opacity = "0";
-    await requestPlan();
-    toast("已填入含移笔 / 删笔 / 缺笔错误的示例");
+    prepareDraft();
+    toast("已填入含移笔 / 删笔 / 缺笔错误的示例，各档试算准备中…");
   } catch (e) {
     toast("示例载入失败：" + e.message);
   }
@@ -788,19 +1131,62 @@ async function loadSample() {
 
 /* --------------------------- wire controls --------------------------- */
 
-$("threshold").addEventListener("input", (e) => {
-  state.threshold = Number(e.target.value);
+const thresholdSlider = $("threshold");
+thresholdSlider.addEventListener("input", (e) => {
+  const v = Number(e.target.value);
+  state.threshold = v;
   $("thresholdValue").textContent = e.target.value;
-});
-$("threshold").addEventListener("change", () => {
-  if (!state.everPlanned) return;
-  invalidatePlan();
-  requestPlan();
+
+  if (!state.sliderActive) {
+    state.sliderActive = true;
+    state.playing = false;
+    // A fresh (re-)drag voids any formal plan still in flight; its response
+    // is token-dropped / aborted and must not reach the screen.
+    cancelFormalPlan();
+    // Dragging before the first solve arms the one-time trial preparation.
+    if (!state.live) {
+      state.live = true;
+      discardResults();
+      prepareDraft({ plan: false });
+    }
+  }
+  // With trials prepared this is a pure local render: no request is sent.
+  renderTrialProbe();
+  updatePlanButtons();
 });
 
-$("btnPlan").addEventListener("click", requestPlan);
+thresholdSlider.addEventListener("change", async (e) => {
+  const v = Number(e.target.value);
+  state.threshold = v;
+  $("thresholdValue").textContent = e.target.value;
+  state.sliderActive = false;
+  state.pb = 0;
+  renderTrialProbe();
+  renderStepList();
+  updatePlanButtons();
+
+  if (!state.live) {
+    // Commit before any input armed preparation (defensive): first solve.
+    startSolving();
+    return;
+  }
+  // Release: generate the formal plan for exactly the selected stop. Its
+  // feasibility / counts must equal the local trial for this threshold.
+  const ok = await requestPlan();
+  if (ok) renderTrialProbe();
+});
+
+$("btnPlan").addEventListener("click", startSolving);
+$("btnPlanRetry").addEventListener("click", () => {
+  state.planError = "";
+  requestPlan();
+});
+$("btnTrialRetry").addEventListener("click", () => {
+  requestPreview();
+});
 $("btnAdopt").addEventListener("click", adoptNext);
 $("btnUndo").addEventListener("click", () => {
+  if (!state.strokes.length) return;
   state.strokes.pop();
   afterStrokesChanged();
 });
@@ -839,5 +1225,9 @@ $("btnResetPb").addEventListener("click", () => {
 
 /* ------------------------------ boot ------------------------------ */
 resizeCanvas();
+renderTrialProbe();
 requestAnimationFrame(render);
 initCharacters().catch((e) => toast("范字加载失败：" + e.message));
+
+// Debug / DOM-smoke hook: read-only-ish access to the prepared trials.
+window.__strokeApp = { state, sliderLevels, currentTrial };

@@ -18,6 +18,8 @@
 }
 
 * { box-sizing: border-box; }
+/* The hidden attribute must always win over component display rules. */
+[hidden] { display: none !important; }
 html, body { margin: 0; padding: 0; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
@@ -54,6 +56,53 @@ h2 { font-size: 15px; margin: 0 0 8px; }
 .threshold-box input[type="range"] { width: 170px; accent-color: var(--brand); }
 .threshold-value { font-size: 12px; color: var(--ink-soft); white-space: nowrap; }
 .threshold-value b { color: var(--brand); font-size: 14px; }
+.top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.threshold-probe {
+  font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+  background: var(--bg); border: 1px solid var(--line);
+  padding: 7px 12px; border-radius: 999px; white-space: nowrap;
+  max-width: 46vw; overflow: hidden; text-overflow: ellipsis;
+}
+.threshold-probe.is-feasible { color: #176e3c; background: var(--green-soft); border-color: #b7e0c6; }
+.threshold-probe.is-infeasible { color: #8c1f16; background: var(--red-soft); border-color: #f0b3ac; }
+.threshold-probe.is-busy { color: #7a5b00; background: #fff6e0; border-color: #ecd488; }
+.threshold-probe:empty { display: none; }
+
+/* Slider-stop trial bar (sits directly above the canvas). */
+.trial-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap; border: 1px solid var(--line); border-radius: 12px;
+  background: #fffdf8; padding: 10px 14px; margin-bottom: 14px;
+  transition: background .12s, border-color .12s;
+}
+.trial-bar[hidden] { display: none; }
+.trial-bar.is-feasible { background: var(--green-soft); border-color: #b7e0c6; }
+.trial-bar.is-infeasible { background: var(--red-soft); border-color: #f0b3ac; }
+.trial-bar.is-loading { background: #fffaf0; border-color: #ecd488; }
+.trial-bar.is-error { background: #fff6e0; border-color: #ecd488; }
+.trial-bar.is-dragging { outline: 2px solid rgba(156, 43, 37, .35); outline-offset: 1px; }
+.trial-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.trial-title { font-size: 13.5px; font-weight: 700; white-space: nowrap; }
+.trial-title b { color: var(--brand); font-size: 15px; }
+.trial-line { font-size: 13.5px; }
+.trial-line b { font-size: 17px; color: var(--brand); }
+.trial-bar.is-infeasible .trial-line > b { color: var(--red); }
+.trial-chips { display: inline-flex; gap: 6px; margin-left: 8px; }
+.trial-chips .chip { font-style: normal; padding: 2px 9px; font-size: 12px; }
+.trial-chips .chip b { font-size: 12.5px; color: inherit; }
+.trial-nosol { color: #8c1f16; font-weight: 600; }
+.trial-reason { font-weight: 400; font-size: 12px; margin-left: 6px; }
+.trial-error { color: #7a5b00; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
+.trial-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.trial-hint {
+  font-size: 12px; color: #7a5b00; background: #fff6e0;
+  border: 1px solid #ecd488; border-radius: 999px; padding: 3px 10px; white-space: nowrap;
+}
+.trial-consistent { font-size: 12px; color: #176e3c; font-weight: 600; white-space: nowrap; }
+.btn-mini { padding: 3px 10px; font-size: 12px; border-radius: 7px; }
+.notice .btn-mini { margin-left: 8px; vertical-align: middle; }
+.notice-info { background: var(--blue-soft); border: 1px solid #b9d2f7; color: #174a9e; }
+.playback.is-locked { opacity: .55; pointer-events: none; }
 
 .layout {
   display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
@@ -146,6 +195,14 @@ h2 { font-size: 15px; margin: 0 0 8px; }
 .link-del { border: none; background: none; color: var(--red); cursor: pointer; font-size: 12.5px; padding: 3px 6px; border-radius: 6px; }
 .link-del:hover { background: var(--red-soft); }
 .link-del:disabled { color: #bdb6a6; cursor: not-allowed; background: none; text-decoration: line-through; }
+.order-actions { display: inline-flex; flex-direction: column; gap: 2px; }
+.link-order {
+  border: 1px solid var(--line); background: #fff; color: var(--ink-soft);
+  cursor: pointer; font-size: 11px; line-height: 1; padding: 1px 5px;
+  border-radius: 5px; min-width: 24px;
+}
+.link-order:hover:not(:disabled) { border-color: var(--brand-soft); color: var(--brand); background: #fbecea; }
+.link-order:disabled { opacity: .35; cursor: not-allowed; }
 .empty { color: var(--ink-soft); font-size: 13px; border: 1px dashed var(--line); border-radius: 10px; padding: 14px; text-align: center; margin-top: 10px; }
 
 /* Plan */

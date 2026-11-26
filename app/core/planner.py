@@ -465,3 +465,105 @@ def build_plan(
         "threshold": threshold,
         "n_model": n_model,
     }
+
+
+# ---------------------------------------------------------------------------
+# Slider sweep / trial preparation.
+# ---------------------------------------------------------------------------
+
+def normalize_thresholds(raw: Any, limit: int = 200) -> List[float]:
+    """Coerce a client threshold list to unique, sorted, non-negative floats.
+
+    Raises ``ValueError`` for non-numeric entries or an over-long list.
+    Integral values are kept as ``float`` here; callers may render them ints.
+    """
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("thresholds 必须是数组")
+    if len(raw) == 0:
+        raise ValueError("thresholds 至少要有一档")
+    if len(raw) > limit:
+        raise ValueError(f"一次最多试算 {limit} 档")
+    out: Set[float] = set()
+    for v in raw:
+        try:
+            t = float(v)
+        except (TypeError, ValueError):
+            raise ValueError("每档上限必须是数字")
+        if not math.isfinite(t):
+            raise ValueError("上限必须是有限数字")
+        out.add(max(0.0, t))
+    return sorted(out)
+
+
+def _threshold_json_value(t: float) -> Any:
+    return int(t) if float(t).is_integer() else round(t, 4)
+
+
+def build_preview(
+    strokes: Sequence[Dict[str, Any]],
+    model: Sequence[Any],
+    thresholds: Sequence[float],
+) -> Dict[str, Any]:
+    """Trial-solve every slider stop, sharing distances and identical matrices.
+
+    The directional discrete Frechet distance of every actual/model stroke
+    pair is evaluated exactly once.  Each threshold turns that one distance
+    matrix into a compatibility matrix; thresholds whose compatibility
+    matrices are entry-wise identical share a single DP solve.  The returned
+    per-level feasibility / cost / counts are exactly what ``build_plan``
+    reproduces for the same threshold.
+    """
+    validation_error = validate_payload(strokes, model)
+    if validation_error is not None:
+        return {"feasible": False, "reason": validation_error, "levels": [],
+                "solve_count": 0, "level_count": 0}
+
+    try:
+        levels_in = normalize_thresholds(thresholds)
+    except ValueError as exc:
+        return {"feasible": False, "reason": str(exc), "levels": [],
+                "solve_count": 0, "level_count": 0}
+
+    K, N = len(strokes), len(model)
+    # ONE distance matrix for the whole preparation.  Direction is preserved.
+    dist = [
+        [discrete_frechet(points_of(strokes[x]), points_of(model[j])) for j in range(N)]
+        for x in range(K)
+    ]
+    pres = preserved_of(strokes)
+    pres = list(pres) + [False] * max(0, K - len(pres))
+
+    solve_cache: Dict[Tuple[Tuple[bool, ...], ...], SolveResult] = {}
+    levels: List[Dict[str, Any]] = []
+
+    for t in levels_in:
+        compatible = tuple(
+            tuple(dist[x][j] <= t + 1e-9 for j in range(N)) for x in range(K)
+        )
+        cached = solve_cache.get(compatible)
+        if cached is None:
+            cached = solve_matrix([list(row) for row in compatible], pres, N)
+            solve_cache[compatible] = cached
+        r = cached
+        item: Dict[str, Any] = {"threshold": _threshold_json_value(t)}
+        if r.feasible:
+            item.update({
+                "feasible": True,
+                "cost": r.cost,
+                "counts": r.counts(),
+                "reason": "",
+            })
+        else:
+            reason = r.reason or _infeasible_reason(pres, [list(row) for row in compatible])
+            item.update({"feasible": False, "cost": None, "counts": None,
+                         "reason": reason})
+        levels.append(item)
+
+    return {
+        "feasible": True,
+        "levels": levels,
+        "dist": dist,
+        "pair_count": K * N,
+        "level_count": len(levels),
+        "solve_count": len(solve_cache),
+    }
